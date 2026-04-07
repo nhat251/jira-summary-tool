@@ -1,0 +1,508 @@
+from __future__ import annotations
+
+import argparse
+import base64
+import concurrent.futures
+import json
+import os
+import re
+import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+import requests
+from requests.auth import HTTPBasicAuth
+
+UCTALENT_HOST = "uctalent.atlassian.net"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+JIRA_FIELDS = "summary,description,attachment"
+JIRA_TIMEOUT_SECONDS = 30
+GEMINI_TIMEOUT_SECONDS = 60
+MAX_IMAGES_PER_BATCH = 5
+ERROR_PREFIX = "ERROR:"
+RESULTS_ROOT_DIR = Path(__file__).resolve().with_name("result")
+JIRA_BROWSE_PATH_PATTERN = re.compile(r"^/browse/([A-Z][A-Z0-9]*-\d+)$")
+ISSUE_KEY_HINT_PATTERN = re.compile(r"/browse/([A-Z][A-Z0-9]*-\d+)")
+
+
+def _parse_env_line(line: str) -> tuple[str, str] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+
+    if stripped.startswith("export "):
+        stripped = stripped[7:].lstrip()
+
+    if "=" not in stripped:
+        return None
+
+    key, value = stripped.split("=", 1)
+    key = key.strip()
+    value = value.strip()
+
+    if not key:
+        return None
+
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        value = value[1:-1]
+
+    return key, value
+
+
+def load_env_file(env_path: str | Path | None = None) -> None:
+    if env_path is None:
+        env_path = Path(__file__).resolve().with_name(".env")
+    else:
+        env_path = Path(env_path)
+
+    if not env_path.exists():
+        return
+
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        parsed = _parse_env_line(line)
+        if parsed is None:
+            continue
+
+        key, value = parsed
+        os.environ.setdefault(key, value)
+
+
+def get_result_date_label(current_datetime: datetime | None = None) -> str:
+    if current_datetime is None:
+        current_datetime = datetime.now()
+    return current_datetime.strftime("%d-%m-%Y")
+
+
+def get_results_directory(
+    root_dir: str | Path | None = None,
+    current_date: str | None = None,
+) -> Path:
+    base_dir = RESULTS_ROOT_DIR if root_dir is None else Path(root_dir)
+    date_label = current_date or get_result_date_label()
+    directory = base_dir / date_label
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def build_result_markdown(result: dict[str, str]) -> str:
+    key = result.get("key") or "UNKNOWN"
+    title = result.get("title", "").strip()
+    summary = result.get("summary", "").strip()
+
+    parts = [f"# {key}"]
+    if title:
+        parts.append(f"**Title:** {title}")
+    parts.append("## Summary")
+    parts.append(summary or "_No summary returned._")
+    return "\n\n".join(parts).strip() + "\n"
+
+
+def persist_issue_result(
+    result: dict[str, str],
+    root_dir: str | Path | None = None,
+    current_date: str | None = None,
+) -> Path:
+    key = result.get("key") or "unknown-issue"
+    directory = get_results_directory(root_dir=root_dir, current_date=current_date)
+    file_path = directory / f"{key}.md"
+    file_path.write_text(build_result_markdown(result), encoding="utf-8")
+    return file_path
+
+
+def parse_jira_url(url: str) -> tuple[str, str]:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("Invalid format or unsupported URL")
+
+    host = (parsed.hostname or "").lower()
+    match = JIRA_BROWSE_PATH_PATTERN.fullmatch(parsed.path)
+    if host != UCTALENT_HOST or not match:
+        raise ValueError("Invalid format or unsupported URL")
+
+    return host, match.group(1)
+
+
+def extract_issue_key_hint(url: str) -> str:
+    match = ISSUE_KEY_HINT_PATTERN.search(url)
+    return match.group(1) if match else ""
+
+
+def _join_non_empty(parts: list[str], separator: str = "") -> str:
+    return separator.join(part for part in parts if part)
+
+
+def _format_list_item(text: str, prefix: str) -> str:
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+
+    formatted = [f"{prefix} {lines[0]}"]
+    formatted.extend(f"  {line}" for line in lines[1:])
+    return "\n".join(formatted)
+
+
+def _extract_adf_text(node: Any) -> str:
+    if not isinstance(node, dict):
+        return ""
+
+    node_type = node.get("type")
+    content = node.get("content", [])
+
+    if node_type == "text":
+        return node.get("text", "")
+    if node_type == "hardBreak":
+        return "\n"
+    if node_type == "mention":
+        return node.get("attrs", {}).get("text", "")
+    if node_type == "emoji":
+        return node.get("attrs", {}).get("text", "")
+    if node_type == "inlineCard":
+        return node.get("attrs", {}).get("url", "")
+    if node_type in {"doc", "tableCell", "tableHeader"}:
+        return _join_non_empty([_extract_adf_text(child) for child in content])
+    if node_type in {"paragraph", "heading", "blockquote", "codeBlock"}:
+        text = _join_non_empty([_extract_adf_text(child) for child in content]).strip()
+        return f"{text}\n\n" if text else ""
+    if node_type == "bulletList":
+        items = [
+            _format_list_item(_extract_adf_text(item).strip(), "-")
+            for item in content
+        ]
+        items_text = "\n".join(item for item in items if item)
+        return f"{items_text}\n\n" if items_text else ""
+    if node_type == "orderedList":
+        items: list[str] = []
+        for index, item in enumerate(content, start=1):
+            item_text = _format_list_item(_extract_adf_text(item).strip(), f"{index}.")
+            if item_text:
+                items.append(item_text)
+        items_text = "\n".join(items)
+        return f"{items_text}\n\n" if items_text else ""
+    if node_type == "listItem":
+        return _join_non_empty([_extract_adf_text(child) for child in content])
+    if node_type == "table":
+        rows = [_extract_adf_text(child).rstrip() for child in content]
+        table_text = "\n".join(row for row in rows if row)
+        return f"{table_text}\n\n" if table_text else ""
+    if node_type == "tableRow":
+        cells = [_extract_adf_text(child).strip() for child in content]
+        row_text = " | ".join(cell for cell in cells if cell)
+        return f"{row_text}\n" if row_text else ""
+
+    return _join_non_empty([_extract_adf_text(child) for child in content])
+
+
+def extract_adf_text(node: Any) -> str:
+    text = _extract_adf_text(node).strip()
+    return re.sub(r"\n{3,}", "\n\n", text)
+
+
+def parse_description(description_field: Any) -> str:
+    if not description_field:
+        return ""
+    if isinstance(description_field, str):
+        return description_field.strip()
+    if isinstance(description_field, dict) and description_field.get("type") == "doc":
+        return extract_adf_text(description_field)
+    return str(description_field).strip()
+
+
+def chunk_items(items: list[dict[str, Any]], chunk_size: int) -> list[list[dict[str, Any]]]:
+    return [items[index:index + chunk_size] for index in range(0, len(items), chunk_size)]
+
+
+def build_jira_session(email: str, token: str) -> requests.Session:
+    session = requests.Session()
+    session.auth = HTTPBasicAuth(email, token)
+    session.headers.update({"Accept": "application/json"})
+    return session
+
+
+def fetch_issue(session: requests.Session, key: str) -> dict[str, Any]:
+    api_url = f"https://{UCTALENT_HOST}/rest/api/3/issue/{key}?fields={JIRA_FIELDS}"
+    response = session.get(api_url, timeout=JIRA_TIMEOUT_SECONDS)
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Failed to access issue {key} (HTTP {response.status_code} - {response.reason})"
+        )
+    return response.json()
+
+
+def collect_issue_images(
+    session: requests.Session,
+    issue_key: str,
+    attachments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    images: list[dict[str, Any]] = []
+
+    for attachment in attachments:
+        mime_type = attachment.get("mimeType", "")
+        content_url = attachment.get("content")
+        if not mime_type.startswith("image/") or not content_url:
+            continue
+
+        response = session.get(content_url, timeout=JIRA_TIMEOUT_SECONDS)
+        if response.status_code != 200:
+            continue
+
+        image_index = len(images) + 1
+        filename = attachment.get("filename", f"image-{image_index}")
+        images.append(
+            {
+                "label": f"Issue: {issue_key} | Image {image_index} | {filename}",
+                "mime_type": mime_type,
+                "data": response.content,
+            }
+        )
+
+    return images
+
+
+def build_initial_prompt(title: str, description: str) -> str:
+    return (
+        "Summarize this Jira task for a developer:\n"
+        f"Title: {title}\n"
+        f"Description: {description}\n\n"
+        "Return a concise Markdown summary using Vietnamese. Use images only as extra task context."
+    )
+
+
+def build_followup_prompt(issue_key: str, title: str) -> str:
+    return (
+        f"Update the existing Markdown summary for Jira issue {issue_key}.\n"
+        f"Title: {title}\n"
+        "Use the existing Markdown summary and the new images to produce the full updated Markdown summary.\n"
+        "Return only the complete updated Markdown."
+    )
+
+
+def extract_gemini_text(payload: dict[str, Any]) -> str:
+    candidates = payload.get("candidates") or []
+    if not candidates:
+        raise RuntimeError("Gemini returned no candidates")
+
+    parts = candidates[0].get("content", {}).get("parts", [])
+    texts = [part.get("text", "").strip() for part in parts if part.get("text")]
+    response_text = "\n".join(text for text in texts if text).strip()
+    if not response_text:
+        raise RuntimeError("Gemini returned no text")
+
+    return response_text
+
+
+def call_gemini(api_key: str, model: str, parts: list[dict[str, Any]]) -> str:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
+    }
+    payload = {"contents": [{"parts": parts}]}
+    response = requests.post(
+        url,
+        headers=headers,
+        json=payload,
+        timeout=GEMINI_TIMEOUT_SECONDS,
+    )
+
+    if response.status_code != 200:
+        message = ""
+        try:
+            message = response.json().get("error", {}).get("message", "")
+        except ValueError:
+            message = response.text.strip()
+
+        detail = f": {message}" if message else ""
+        raise RuntimeError(
+            f"Gemini request failed (HTTP {response.status_code}){detail}"
+        )
+
+    return extract_gemini_text(response.json())
+
+
+def create_temp_markdown_path(issue_key: str, temp_dir: str | None = None) -> Path:
+    handle, path = tempfile.mkstemp(
+        prefix=f"{issue_key.lower()}-",
+        suffix=".md",
+        dir=temp_dir,
+        text=True,
+    )
+    os.close(handle)
+    return Path(path)
+
+
+def build_image_parts(images: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    parts: list[dict[str, Any]] = []
+    for image in images:
+        parts.append({"text": image["label"]})
+        parts.append(
+            {
+                "inline_data": {
+                    "mime_type": image["mime_type"],
+                    "data": base64.b64encode(image["data"]).decode("ascii"),
+                }
+            }
+        )
+    return parts
+
+
+def summarize_with_gemini(
+    issue_key: str,
+    title: str,
+    description: str,
+    images: list[dict[str, Any]],
+    api_key: str,
+    model: str,
+    temp_dir: str | None = None,
+) -> str:
+    image_batches = chunk_items(images, MAX_IMAGES_PER_BATCH)
+    markdown_path: Path | None = None
+
+    try:
+        if len(image_batches) > 1:
+            markdown_path = create_temp_markdown_path(issue_key, temp_dir=temp_dir)
+
+        current_summary = ""
+        if not image_batches:
+            return call_gemini(
+                api_key,
+                model,
+                [{"text": build_initial_prompt(title, description)}],
+            ).strip()
+
+        for index, batch_images in enumerate(image_batches):
+            if index == 0:
+                parts = [{"text": build_initial_prompt(title, description)}]
+            else:
+                existing_markdown = markdown_path.read_text(encoding="utf-8")
+                parts = [
+                    {"text": build_followup_prompt(issue_key, title)},
+                    {
+                        "text": (
+                            f"Current Markdown summary for issue {issue_key}:\n\n"
+                            f"{existing_markdown}"
+                        )
+                    },
+                ]
+
+            parts.extend(build_image_parts(batch_images))
+            current_summary = call_gemini(api_key, model, parts).strip()
+
+            if markdown_path is not None:
+                markdown_path.write_text(current_summary, encoding="utf-8")
+
+        return current_summary
+    finally:
+        if markdown_path is not None and markdown_path.exists():
+            markdown_path.unlink()
+
+
+def process_url(
+    url: str,
+    jira_email: str,
+    jira_token: str,
+    gemini_api_key: str,
+    gemini_model: str,
+    temp_dir: str | None = None,
+) -> dict[str, str]:
+    key = extract_issue_key_hint(url)
+    title = ""
+    session: requests.Session | None = None
+
+    try:
+        _, key = parse_jira_url(url)
+        session = build_jira_session(jira_email, jira_token)
+
+        issue_payload = fetch_issue(session, key)
+        fields = issue_payload.get("fields", {})
+        title = fields.get("summary", "")
+        description = parse_description(fields.get("description"))
+        images = collect_issue_images(session, key, fields.get("attachment", []))
+        summary = summarize_with_gemini(
+            issue_key=key,
+            title=title,
+            description=description,
+            images=images,
+            api_key=gemini_api_key,
+            model=gemini_model,
+            temp_dir=temp_dir,
+        )
+        return {"key": key, "title": title, "summary": summary}
+    except Exception as error:
+        return {
+            "key": key,
+            "title": title,
+            "summary": f"{ERROR_PREFIX} {error}",
+        }
+    finally:
+        if session is not None:
+            session.close()
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="UCTalent Jira issue summarizer")
+    parser.add_argument("--url", action="append", required=True, help="UCTalent Jira issue URL")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    load_env_file()
+
+    jira_email = os.environ.get("JIRA_EMAIL")
+    jira_token = os.environ.get("JIRA_API_TOKEN")
+    gemini_api_key = os.environ.get("GEMINI_API_KEY")
+    gemini_model = os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+
+    if not all([jira_email, jira_token, gemini_api_key]):
+        print(
+            "ERROR: Missing required environment variables: "
+            "JIRA_EMAIL, JIRA_API_TOKEN, GEMINI_API_KEY",
+            file=sys.stderr,
+        )
+        return 1
+
+    results: list[dict[str, str] | None] = [None] * len(args.url)
+    max_workers = max(1, min(5, len(args.url)))
+    persist_errors: list[str] = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                process_url,
+                url,
+                jira_email,
+                jira_token,
+                gemini_api_key,
+                gemini_model,
+            ): index
+            for index, url in enumerate(args.url)
+        }
+        for future in concurrent.futures.as_completed(futures):
+            index = futures[future]
+            result = future.result()
+            results[index] = result
+            try:
+                persist_issue_result(result)
+            except OSError as error:
+                persist_errors.append(str(error))
+                issue_key = result.get("key") or args.url[index]
+                print(
+                    f"ERROR: Failed to write result file for {issue_key}: {error}",
+                    file=sys.stderr,
+                )
+
+    final_results = [result for result in results if result is not None]
+    print(json.dumps(final_results, indent=2, ensure_ascii=False))
+
+    has_errors = any(
+        result["summary"].startswith(ERROR_PREFIX)
+        for result in final_results
+    )
+    return 1 if has_errors or persist_errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

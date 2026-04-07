@@ -7,6 +7,7 @@ import pytest
 import jira_issue_summarizer as summarizer
 from jira_issue_summarizer import (
     ERROR_PREFIX,
+    GEMINI_API_BASE_URL,
     MAX_IMAGES_PER_BATCH,
     extract_adf_text,
     load_env_file,
@@ -15,6 +16,7 @@ from jira_issue_summarizer import (
     persist_issue_result,
     process_url,
     summarize_with_gemini,
+    upload_gemini_file,
 )
 
 
@@ -118,6 +120,43 @@ def test_extract_adf_text_handles_paragraphs_lists_and_tables():
 
 
 @patch("jira_issue_summarizer.requests.post")
+def test_upload_gemini_file_uses_resumable_api(mock_post):
+    start_response = MagicMock()
+    start_response.status_code = 200
+    start_response.headers = {"X-Goog-Upload-URL": "https://upload.example/file"}
+
+    finalize_response = MagicMock()
+    finalize_response.status_code = 200
+    finalize_response.json.return_value = {
+        "file": {
+            "name": "files/abc123",
+            "uri": "https://generativelanguage.googleapis.com/v1beta/files/abc123",
+            "mimeType": "image/png",
+        }
+    }
+
+    mock_post.side_effect = [start_response, finalize_response]
+
+    uploaded = upload_gemini_file(
+        "gemini-key",
+        {
+            "label": "Issue: UC-455 | Image 1 | bug.png",
+            "mime_type": "image/png",
+            "data": b"image-bytes",
+        },
+    )
+
+    assert uploaded == {
+        "name": "files/abc123",
+        "uri": "https://generativelanguage.googleapis.com/v1beta/files/abc123",
+        "mime_type": "image/png",
+        "label": "Issue: UC-455 | Image 1 | bug.png",
+    }
+    assert mock_post.call_args_list[0].args[0] == f"{GEMINI_API_BASE_URL}/upload/v1beta/files"
+    assert mock_post.call_args_list[1].args[0] == "https://upload.example/file"
+
+
+@patch("jira_issue_summarizer.requests.post")
 def test_summarize_with_gemini_uses_text_only_when_no_images(mock_post):
     mock_post.return_value = make_gemini_response("Text only summary")
 
@@ -137,11 +176,24 @@ def test_summarize_with_gemini_uses_text_only_when_no_images(mock_post):
     assert "Summarize this Jira task for a developer" in parts[0]["text"]
 
 
+@patch("jira_issue_summarizer.delete_gemini_file")
+@patch("jira_issue_summarizer.upload_gemini_file")
 @patch("jira_issue_summarizer.requests.post")
-def test_summarize_with_gemini_batches_images_and_cleans_temp_markdown(mock_post, tmp_path):
-    mock_post.side_effect = [
-        make_gemini_response("# Batch 1"),
-        make_gemini_response("# Final summary"),
+def test_summarize_with_gemini_batches_images_and_cleans_temp_markdown(
+    mock_post,
+    mock_upload_gemini_file,
+    mock_delete_gemini_file,
+    tmp_path,
+):
+    mock_post.side_effect = [make_gemini_response("# Batch 1"), make_gemini_response("# Final summary")]
+    mock_upload_gemini_file.side_effect = [
+        {
+            "name": f"files/{index}",
+            "uri": f"https://files.example/{index}",
+            "mime_type": "image/png",
+            "label": f"Issue: UC-455 | Image {index} | img-{index}.png",
+        }
+        for index in range(1, MAX_IMAGES_PER_BATCH + 3)
     ]
     images = [
         {
@@ -164,12 +216,15 @@ def test_summarize_with_gemini_batches_images_and_cleans_temp_markdown(mock_post
 
     assert summary == "# Final summary"
     assert mock_post.call_count == 2
+    assert mock_upload_gemini_file.call_count == MAX_IMAGES_PER_BATCH + 2
+    assert mock_delete_gemini_file.call_count == MAX_IMAGES_PER_BATCH + 2
 
     first_parts = mock_post.call_args_list[0].kwargs["json"]["contents"][0]["parts"]
     second_parts = mock_post.call_args_list[1].kwargs["json"]["contents"][0]["parts"]
 
     assert len(first_parts) == 1 + (MAX_IMAGES_PER_BATCH * 2)
     assert first_parts[1]["text"] == "Issue: UC-455 | Image 1 | img-1.png"
+    assert first_parts[2]["file_data"]["file_uri"] == "https://files.example/1"
     assert "Current Markdown summary for issue UC-455" in second_parts[1]["text"]
     assert "# Batch 1" in second_parts[1]["text"]
     assert not list(tmp_path.glob("*.md"))
@@ -201,9 +256,16 @@ def test_process_url_returns_error_object_for_issue_http_errors(mock_session_cls
     mock_post.assert_not_called()
 
 
+@patch("jira_issue_summarizer.delete_gemini_file")
+@patch("jira_issue_summarizer.upload_gemini_file")
 @patch("jira_issue_summarizer.requests.post")
 @patch("jira_issue_summarizer.requests.Session")
-def test_process_url_summarizes_only_successful_images(mock_session_cls, mock_post):
+def test_process_url_summarizes_only_successful_images(
+    mock_session_cls,
+    mock_post,
+    mock_upload_gemini_file,
+    mock_delete_gemini_file,
+):
     mock_session = MagicMock()
     mock_session_cls.return_value = mock_session
 
@@ -250,6 +312,12 @@ def test_process_url_summarizes_only_successful_images(mock_session_cls, mock_po
 
     mock_session.get.side_effect = [issue_response, image_ok, image_fail]
     mock_post.return_value = make_gemini_response("This is a summary")
+    mock_upload_gemini_file.return_value = {
+        "name": "files/1",
+        "uri": "https://files.example/1",
+        "mime_type": "image/png",
+        "label": "Issue: UC-455 | Image 1 | screen-1.png",
+    }
 
     result = process_url(
         "https://uctalent.atlassian.net/browse/UC-455",
@@ -270,7 +338,9 @@ def test_process_url_summarizes_only_successful_images(mock_session_cls, mock_po
 
     assert "String from ADF" in parts[0]["text"]
     assert parts[1]["text"] == "Issue: UC-455 | Image 1 | screen-1.png"
+    assert parts[2]["file_data"]["file_uri"] == "https://files.example/1"
     assert len(parts) == 3
+    mock_delete_gemini_file.assert_called_once_with("gemini-key", "files/1")
 
 
 def test_main_prints_json_returns_non_zero_and_writes_markdown_results(

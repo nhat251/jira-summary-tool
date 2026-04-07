@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import concurrent.futures
 import json
 import os
@@ -18,6 +17,7 @@ from requests.auth import HTTPBasicAuth
 
 UCTALENT_HOST = "uctalent.atlassian.net"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com"
 JIRA_FIELDS = "summary,description,attachment"
 JIRA_TIMEOUT_SECONDS = 30
 GEMINI_TIMEOUT_SECONDS = 60
@@ -293,8 +293,75 @@ def extract_gemini_text(payload: dict[str, Any]) -> str:
     return response_text
 
 
+def upload_gemini_file(api_key: str, image: dict[str, Any]) -> dict[str, str]:
+    start_headers = {
+        "x-goog-api-key": api_key,
+        "X-Goog-Upload-Protocol": "resumable",
+        "X-Goog-Upload-Command": "start",
+        "X-Goog-Upload-Header-Content-Length": str(len(image["data"])),
+        "X-Goog-Upload-Header-Content-Type": image["mime_type"],
+        "Content-Type": "application/json",
+    }
+    start_response = requests.post(
+        f"{GEMINI_API_BASE_URL}/upload/v1beta/files",
+        headers=start_headers,
+        json={"file": {"display_name": image["label"]}},
+        timeout=GEMINI_TIMEOUT_SECONDS,
+    )
+    if start_response.status_code not in {200, 201}:
+        raise RuntimeError(
+            f"Gemini file upload start failed (HTTP {start_response.status_code})"
+        )
+
+    upload_url = start_response.headers.get("X-Goog-Upload-URL")
+    if not upload_url:
+        raise RuntimeError("Gemini file upload did not return an upload URL")
+
+    upload_headers = {
+        "Content-Length": str(len(image["data"])),
+        "X-Goog-Upload-Offset": "0",
+        "X-Goog-Upload-Command": "upload, finalize",
+    }
+    upload_response = requests.post(
+        upload_url,
+        headers=upload_headers,
+        data=image["data"],
+        timeout=GEMINI_TIMEOUT_SECONDS,
+    )
+    if upload_response.status_code not in {200, 201}:
+        raise RuntimeError(
+            f"Gemini file upload failed (HTTP {upload_response.status_code})"
+        )
+
+    payload = upload_response.json().get("file", {})
+    file_name = payload.get("name")
+    file_uri = payload.get("uri")
+    mime_type = payload.get("mimeType") or image["mime_type"]
+    if not file_name or not file_uri:
+        raise RuntimeError("Gemini file upload returned incomplete metadata")
+
+    return {
+        "name": file_name,
+        "uri": file_uri,
+        "mime_type": mime_type,
+        "label": image["label"],
+    }
+
+
+def delete_gemini_file(api_key: str, file_name: str) -> None:
+    response = requests.delete(
+        f"{GEMINI_API_BASE_URL}/v1beta/{file_name}",
+        headers={"x-goog-api-key": api_key},
+        timeout=GEMINI_TIMEOUT_SECONDS,
+    )
+    if response.status_code not in {200, 204}:
+        raise RuntimeError(
+            f"Gemini file delete failed for {file_name} (HTTP {response.status_code})"
+        )
+
+
 def call_gemini(api_key: str, model: str, parts: list[dict[str, Any]]) -> str:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    url = f"{GEMINI_API_BASE_URL}/v1beta/models/{model}:generateContent"
     headers = {
         "Content-Type": "application/json",
         "x-goog-api-key": api_key,
@@ -333,15 +400,15 @@ def create_temp_markdown_path(issue_key: str, temp_dir: str | None = None) -> Pa
     return Path(path)
 
 
-def build_image_parts(images: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def build_uploaded_file_parts(files: list[dict[str, str]]) -> list[dict[str, Any]]:
     parts: list[dict[str, Any]] = []
-    for image in images:
-        parts.append({"text": image["label"]})
+    for file_info in files:
+        parts.append({"text": file_info["label"]})
         parts.append(
             {
-                "inline_data": {
-                    "mime_type": image["mime_type"],
-                    "data": base64.b64encode(image["data"]).decode("ascii"),
+                "file_data": {
+                    "mime_type": file_info["mime_type"],
+                    "file_uri": file_info["uri"],
                 }
             }
         )
@@ -373,6 +440,7 @@ def summarize_with_gemini(
             ).strip()
 
         for index, batch_images in enumerate(image_batches):
+            uploaded_files: list[dict[str, str]] = []
             if index == 0:
                 parts = [{"text": build_initial_prompt(title, description)}]
             else:
@@ -387,8 +455,18 @@ def summarize_with_gemini(
                     },
                 ]
 
-            parts.extend(build_image_parts(batch_images))
-            current_summary = call_gemini(api_key, model, parts).strip()
+            try:
+                for image in batch_images:
+                    uploaded_files.append(upload_gemini_file(api_key, image))
+
+                parts.extend(build_uploaded_file_parts(uploaded_files))
+                current_summary = call_gemini(api_key, model, parts).strip()
+            finally:
+                for uploaded_file in uploaded_files:
+                    try:
+                        delete_gemini_file(api_key, uploaded_file["name"])
+                    except RuntimeError:
+                        pass
 
             if markdown_path is not None:
                 markdown_path.write_text(current_summary, encoding="utf-8")

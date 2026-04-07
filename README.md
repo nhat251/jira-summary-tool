@@ -1,11 +1,12 @@
 # Jira Issue Summarizer
 
-Python CLI tool for UCTalent Jira issues. It fetches issue data from Jira Cloud, converts Jira description content to plain text, sends the task plus image attachments to Gemini, and prints a JSON list.
+Python CLI tool for UCTalent Jira issues. It fetches issue data from Jira Cloud, converts Jira description content to plain text, uploads image attachments to the Gemini Files API, sends the task plus uploaded files to Gemini, and prints a JSON list.
 
 ## What It Does
 
 - Supports only `https://uctalent.atlassian.net/browse/...`
 - Fetches Jira `summary`, `description`, and image attachments
+- Downloads Jira images with Jira Basic Auth, uploads them to the Gemini Files API, then sends Gemini `file_data` references instead of inline base64 payloads
 - Sends at most 5 images per Gemini request
 - For issues with more than 5 images, stores the intermediate Markdown summary in a temporary `.md` file and reuses it in the next Gemini batch
 - Processes multiple issue URLs in parallel

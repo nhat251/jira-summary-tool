@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import tempfile
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -738,8 +739,13 @@ def main(argv: list[str] | None = None) -> int:
     # Auto-generate viewer data context for viewer.html
     try:
         update_viewer_data()
+        
+        viewer_path = RESULTS_ROOT_DIR.parent / "viewer.html"
+        if viewer_path.exists():
+            print(f"Opening viewer in browser...")
+            webbrowser.open(viewer_path.as_uri())
     except Exception as e:
-        print(f"Failed to update viewer data: {e}", file=sys.stderr)
+        print(f"Failed to update viewer data or open browser: {e}", file=sys.stderr)
         
     return 1 if has_errors or persist_errors else 0
 

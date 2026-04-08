@@ -112,6 +112,28 @@ def persist_issue_result(
     return file_path
 
 
+def update_viewer_data(root_dir: str | Path | None = None) -> None:
+    base_dir = RESULTS_ROOT_DIR if root_dir is None else Path(root_dir)
+    if not base_dir.exists():
+        return
+        
+    data = {}
+    for date_dir in base_dir.iterdir():
+        if not date_dir.is_dir():
+            continue
+        if re.match(r"\d{2}-\d{2}-\d{4}", date_dir.name):
+            data[date_dir.name] = {}
+            for md_file in date_dir.glob("*.md"):
+                if md_file.name == "_batch_context.md":
+                    continue
+                file_content = md_file.read_text(encoding="utf-8")
+                data[date_dir.name][md_file.name] = file_content
+                
+    js_content = "const JIRA_RESULTS_DATA = " + json.dumps(data, ensure_ascii=False, indent=2) + ";\n"
+    data_file = base_dir / "data.js"
+    data_file.write_text(js_content, encoding="utf-8")
+
+
 def build_batch_context_entry(result: dict[str, str]) -> str:
     key = result.get("key") or "UNKNOWN"
     title = result.get("title", "").strip()
@@ -602,6 +624,36 @@ def process_url(
             session.close()
 
 
+def generate_combined_summary(
+    results: list[dict[str, str]],
+    api_key: str,
+    model: str
+) -> str:
+    valid_results = [r for r in results if not r["summary"].startswith(ERROR_PREFIX)]
+    if not valid_results:
+        raise ValueError("No valid summaries to combine.")
+
+    context_parts = []
+    for r in valid_results:
+        context_parts.append(f"### Issue: {r['key']} - {r['title']}\n{r['summary']}")
+    
+    combined_context = "\n\n".join(context_parts)
+    
+    prompt = (
+        "Dưới đây là tóm tắt nội dung của một nhóm các công việc (Jira Issues).\n"
+        "Hãy đóng vai 1 Technical Product Manager / Business Analyst, viết ra một bản Tóm tắt Tổng hợp (Executive Summary) chung bằng tiếng Việt dựa trên những nội dung này.\n"
+        "Yêu cầu:\n"
+        "- Trình bày mục tiêu chung hoặc sự liên kết của nhóm công việc (nếu nhận diện được).\n"
+        "- Tóm lược lại các thay đổi quan trọng nhất, các giới hạn cần lưu ý từ các issue ghép lại.\n"
+        "- Tóm tắt danh sách các việc cần làm (to-do list) ở mức tổng quan.\n"
+        "- Sử dụng cấu trúc Markdown với các heading rõ ràng.\n"
+        "- Thông tin cung cấp trong các issue có thể rất chi tiết, hãy đọc kỹ và đưa ra bản tóm tắt súc tích nhưng đầy đủ ý.\n\n"
+        f"Nội dung các issues cần tổng hợp:\n{combined_context}"
+    )
+    
+    return call_gemini(api_key, model, [{"text": prompt}]).strip()
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="UCTalent Jira issue summarizer")
     parser.add_argument("--url", action="append", required=True, help="UCTalent Jira issue URL")
@@ -659,12 +711,36 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     final_results = results
+
+    if len(args.url) > 1:
+        valid_keys = [r["key"] for r in final_results if r.get("key") and not r["summary"].startswith(ERROR_PREFIX)]
+        if valid_keys:
+            try:
+                combined_text = generate_combined_summary(final_results, gemini_api_key, gemini_model)
+                combined_base_name = "_".join(valid_keys)
+                if len(combined_base_name) > 150:
+                    combined_base_name = combined_base_name[:150].rstrip("_")
+                
+                combined_filename = f"{combined_base_name}.md"
+                combined_path = get_results_directory(current_date=date_label) / combined_filename
+                combined_path.write_text(combined_text, encoding="utf-8")
+            except Exception as error:
+                print(f"ERROR: Failed to generate or save combined summary: {error}", file=sys.stderr)
+                persist_errors.append(str(error))
+
     print(json.dumps(final_results, indent=2, ensure_ascii=False))
 
     has_errors = any(
         result["summary"].startswith(ERROR_PREFIX)
         for result in final_results
     )
+    
+    # Auto-generate viewer data context for viewer.html
+    try:
+        update_viewer_data()
+    except Exception as e:
+        print(f"Failed to update viewer data: {e}", file=sys.stderr)
+        
     return 1 if has_errors or persist_errors else 0
 
 

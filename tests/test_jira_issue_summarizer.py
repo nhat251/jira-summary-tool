@@ -7,8 +7,11 @@ import pytest
 import jira_issue_summarizer as summarizer
 from jira_issue_summarizer import (
     ERROR_PREFIX,
+    BATCH_CONTEXT_FILE_NAME,
     GEMINI_API_BASE_URL,
     MAX_IMAGES_PER_BATCH,
+    append_to_batch_context,
+    build_initial_prompt,
     extract_adf_text,
     load_env_file,
     main,
@@ -173,7 +176,29 @@ def test_summarize_with_gemini_uses_text_only_when_no_images(mock_post):
     payload = mock_post.call_args.kwargs["json"]
     parts = payload["contents"][0]["parts"]
     assert len(parts) == 1
-    assert "Summarize this Jira task for a developer" in parts[0]["text"]
+    assert "Use only facts that are explicitly present" in parts[0]["text"]
+    assert "Keep the output length proportional to the source" in parts[0]["text"]
+    assert "Do not shorten away concrete examples" in parts[0]["text"]
+    assert "The goal of shortening is only to remove near-duplicate repetition" in parts[0]["text"]
+    assert "# Tom tat" in parts[0]["text"]
+    assert "# Du lieu quan sat duoc" in parts[0]["text"]
+    assert "# Lien ket issue lien quan" in parts[0]["text"]
+    assert "# Phan tich gioi han" in parts[0]["text"]
+    assert "# Viec can lam" in parts[0]["text"]
+    assert "Output must follow this exact Markdown schema" in parts[0]["text"]
+
+
+def test_build_initial_prompt_includes_related_issue_context():
+    prompt = build_initial_prompt(
+        title="Parent issue",
+        description="Main issue body",
+        related_context_markdown="## UC-100 - Previous issue\n\n- Shared context",
+    )
+
+    assert "Related issue context from earlier URLs in this same run" in prompt
+    assert "## UC-100 - Previous issue" in prompt
+    assert "mention a cross-issue link only when that link is directly supported" in prompt
+    assert "If the user story contains a concrete URL, sample input, exact text, or example scenario, keep it explicitly in the summary." in prompt
 
 
 @patch("jira_issue_summarizer.delete_gemini_file")
@@ -343,7 +368,7 @@ def test_process_url_summarizes_only_successful_images(
     mock_delete_gemini_file.assert_called_once_with("gemini-key", "files/1")
 
 
-def test_main_prints_json_returns_non_zero_and_writes_markdown_results(
+def test_main_links_multiple_issues_through_batch_context_and_writes_markdown_results(
     monkeypatch,
     capsys,
     tmp_path,
@@ -353,11 +378,13 @@ def test_main_prints_json_returns_non_zero_and_writes_markdown_results(
     monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
     monkeypatch.setattr(summarizer, "RESULTS_ROOT_DIR", tmp_path / "result")
     monkeypatch.setattr(summarizer, "get_result_date_label", lambda: "07-04-2026")
+    seen_contexts = []
 
-    def fake_process_url(url, *_args, **_kwargs):
+    def fake_process_url(url, *_args, related_context_markdown="", **_kwargs):
+        seen_contexts.append((url, related_context_markdown))
         if url.endswith("UC-455"):
             return {"key": "UC-455", "title": "A", "summary": "All good"}
-        return {"key": "UC-456", "title": "", "summary": "ERROR: denied"}
+        return {"key": "UC-456", "title": "B", "summary": "Linked to UC-455"}
 
     with patch("jira_issue_summarizer.process_url", side_effect=fake_process_url):
         exit_code = main(
@@ -372,13 +399,21 @@ def test_main_prints_json_returns_non_zero_and_writes_markdown_results(
     captured = capsys.readouterr()
     output = json.loads(captured.out)
 
-    assert exit_code == 1
+    assert exit_code == 0
     assert output == [
         {"key": "UC-455", "title": "A", "summary": "All good"},
-        {"key": "UC-456", "title": "", "summary": "ERROR: denied"},
+        {"key": "UC-456", "title": "B", "summary": "Linked to UC-455"},
     ]
     assert (tmp_path / "result" / "07-04-2026" / "UC-455.md").read_text(encoding="utf-8")
     assert (tmp_path / "result" / "07-04-2026" / "UC-456.md").read_text(encoding="utf-8")
+    assert seen_contexts[0] == ("https://uctalent.atlassian.net/browse/UC-455", "")
+    assert "## UC-455 - A" in seen_contexts[1][1]
+    assert "All good" in seen_contexts[1][1]
+    batch_context_content = (
+        tmp_path / "result" / "07-04-2026" / BATCH_CONTEXT_FILE_NAME
+    ).read_text(encoding="utf-8")
+    assert "## UC-455 - A" in batch_context_content
+    assert "## UC-456 - B" in batch_context_content
 
 
 def test_load_env_file_sets_missing_values_only(tmp_path, monkeypatch):
@@ -424,3 +459,22 @@ def test_persist_issue_result_writes_expected_markdown_file(tmp_path):
     assert "# UC-455" in content
     assert "**Title:** Search bug" in content
     assert "Users see wrong results." in content
+
+
+def test_append_to_batch_context_appends_multiple_issue_summaries(tmp_path):
+    batch_context_path = tmp_path / BATCH_CONTEXT_FILE_NAME
+
+    append_to_batch_context(
+        batch_context_path,
+        {"key": "UC-455", "title": "Issue A", "summary": "Summary A"},
+    )
+    append_to_batch_context(
+        batch_context_path,
+        {"key": "UC-456", "title": "Issue B", "summary": "Summary B"},
+    )
+
+    content = batch_context_path.read_text(encoding="utf-8")
+    assert "## UC-455 - Issue A" in content
+    assert "Summary A" in content
+    assert "## UC-456 - Issue B" in content
+    assert "Summary B" in content

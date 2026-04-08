@@ -9,7 +9,9 @@ Python CLI tool for UCTalent Jira issues. It fetches issue data from Jira Cloud,
 - Downloads Jira images with Jira Basic Auth, uploads them to the Gemini Files API, then sends Gemini `file_data` references instead of inline base64 payloads
 - Sends at most 5 images per Gemini request
 - For issues with more than 5 images, stores the intermediate Markdown summary in a temporary `.md` file and reuses it in the next Gemini batch
-- Processes multiple issue URLs in parallel
+- Uses only information from Jira issue content, images, and related issue summaries from the same run; it does not intentionally invent missing details
+- Keeps the summary length proportional to the input. Long, detailed issues remain detailed
+- When multiple URLs are provided, later issues reuse earlier issue summaries through `result/dd-mm-yyyy/_batch_context.md` so related issues can be linked across the same run
 - Always prints a JSON list, even if one issue fails
 - Writes one Markdown file per issue to `result/dd-mm-yyyy/ISSUEKEY.md`
 
@@ -66,8 +68,9 @@ Generated files:
 
 - `result/07-04-2026/UC-455.md`
 - `result/07-04-2026/UC-456.md`
+- `result/07-04-2026/_batch_context.md`
 
-Each file contains the issue key, title, and the final AI summary in Markdown.
+Each issue file contains the issue key, title, and the final AI summary in Markdown. The `_batch_context.md` file accumulates summaries in input order and is reused as context for later issues in the same run.
 
 If one issue fails, the tool still prints JSON and returns a non-zero exit code:
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import json
 import os
 import re
@@ -24,6 +23,7 @@ GEMINI_TIMEOUT_SECONDS = 60
 MAX_IMAGES_PER_BATCH = 5
 ERROR_PREFIX = "ERROR:"
 RESULTS_ROOT_DIR = Path(__file__).resolve().with_name("result")
+BATCH_CONTEXT_FILE_NAME = "_batch_context.md"
 JIRA_BROWSE_PATH_PATTERN = re.compile(r"^/browse/([A-Z][A-Z0-9]*-\d+)$")
 ISSUE_KEY_HINT_PATTERN = re.compile(r"/browse/([A-Z][A-Z0-9]*-\d+)")
 
@@ -110,6 +110,38 @@ def persist_issue_result(
     file_path = directory / f"{key}.md"
     file_path.write_text(build_result_markdown(result), encoding="utf-8")
     return file_path
+
+
+def build_batch_context_entry(result: dict[str, str]) -> str:
+    key = result.get("key") or "UNKNOWN"
+    title = result.get("title", "").strip()
+    summary = result.get("summary", "").strip() or "Khong ro"
+
+    heading = f"## {key}"
+    if title:
+        heading = f"{heading} - {title}"
+
+    return f"{heading}\n\n{summary}\n"
+
+
+def get_batch_context_path(
+    root_dir: str | Path | None = None,
+    current_date: str | None = None,
+) -> Path:
+    return get_results_directory(root_dir=root_dir, current_date=current_date) / BATCH_CONTEXT_FILE_NAME
+
+
+def read_batch_context(batch_context_path: Path | None) -> str:
+    if batch_context_path is None or not batch_context_path.exists():
+        return ""
+    return batch_context_path.read_text(encoding="utf-8").strip()
+
+
+def append_to_batch_context(batch_context_path: Path, result: dict[str, str]) -> None:
+    existing = read_batch_context(batch_context_path)
+    entry = build_batch_context_entry(result).strip()
+    content = f"{existing}\n\n{entry}".strip() if existing else entry
+    batch_context_path.write_text(f"{content}\n", encoding="utf-8")
 
 
 def parse_jira_url(url: str) -> tuple[str, str]:
@@ -261,21 +293,69 @@ def collect_issue_images(
     return images
 
 
-def build_initial_prompt(title: str, description: str) -> str:
+def build_related_context_block(related_context_markdown: str) -> str:
+    if not related_context_markdown.strip():
+        return ""
+
     return (
-        "Summarize this Jira task for a developer:\n"
+        "Related issue context from earlier URLs in this same run:\n"
+        f"{related_context_markdown.strip()}\n\n"
+        "Treat these issues as related work items, but mention a cross-issue link only when that link is directly supported by the provided issue content or prior summaries.\n\n"
+    )
+
+
+def build_initial_prompt(
+    title: str,
+    description: str,
+    related_context_markdown: str = "",
+) -> str:
+    related_context_block = build_related_context_block(related_context_markdown)
+    return (
+        "Summarize this Jira task for a developer.\n"
+        "Write the answer in Vietnamese.\n"
+        "Use only facts that are explicitly present in the title, description, images, and related issue context provided below.\n"
+        "Do not infer missing details, root cause, solution, priority, owner, timeline, or acceptance criteria.\n"
+        "Do not add assumptions, general best practices, or extra analysis that is not directly supported.\n"
+        "If something is not stated, write 'Khong ro' instead of guessing.\n"
+        "Keep the output length proportional to the source. If the issue content is long or detailed, keep the summary detailed.\n"
+        "Do not shorten away concrete examples, sample values, exact labels, exact messages, URLs, route patterns, delays, counts, IDs, or quoted strings when they help explain the behavior.\n"
+        "If the user story contains a concrete URL, sample input, exact text, or example scenario, keep it explicitly in the summary.\n"
+        "The goal of shortening is only to remove near-duplicate repetition. Do not remove useful examples or clarifying details.\n"
+        "Output must follow this exact Markdown schema and use bullets only inside each section:\n"
+        "# Tom tat\n"
+        "- ...\n"
+        "# Du lieu quan sat duoc\n"
+        "- ...\n"
+        "# Lien ket issue lien quan\n"
+        "- Neu co moi lien he ro rang voi issue khac trong batch, neu issue key va moi lien he do.\n"
+        "- Neu khong ro, ghi 'Khong ro'.\n"
+        "# Phan tich gioi han\n"
+        "- Chi neu nhung nhan dinh co bang chung ro rang tu input.\n"
+        "- Neu khong du du lieu, ghi 'Khong ro'.\n"
+        "# Viec can lam\n"
+        "- ...\n"
         f"Title: {title}\n"
         f"Description: {description}\n\n"
-        "Return a concise Markdown summary using Vietnamese. Use images only as extra task context."
+        f"{related_context_block}"
+        "Return only the Markdown summary. Use images only as supporting context and do not add unsupported conclusions."
     )
 
 
 def build_followup_prompt(issue_key: str, title: str) -> str:
     return (
         f"Update the existing Markdown summary for Jira issue {issue_key}.\n"
+        "Use only the existing summary and the new images.\n"
+        "Do not invent new details or infer anything that is not clearly visible in the current inputs.\n"
+        "Preserve factual statements that are already supported; only revise them when the new images clearly justify it.\n"
+        "Keep the output length proportional to the current summary and new evidence. If the task is detailed, keep the result detailed.\n"
+        "Preserve concrete examples, sample values, exact labels, exact messages, URLs, route patterns, delays, counts, IDs, and quoted strings from the existing summary whenever they are still supported.\n"
+        "Only remove content when it is clearly repetitive. Do not remove useful examples or clarifying details.\n"
+        "Keep the exact same Markdown schema and bullet-only style.\n"
+        "Do not add new sections.\n"
+        "If a section has no supported content, keep a bullet with 'Khong ro'.\n"
         f"Title: {title}\n"
-        "Use the existing Markdown summary and the new images to produce the full updated Markdown summary.\n"
-        "Return only the complete updated Markdown."
+        "Produce the full updated Markdown summary.\n"
+        "Return only the complete updated Markdown, with no extra commentary."
     )
 
 
@@ -422,6 +502,7 @@ def summarize_with_gemini(
     images: list[dict[str, Any]],
     api_key: str,
     model: str,
+    related_context_markdown: str = "",
     temp_dir: str | None = None,
 ) -> str:
     image_batches = chunk_items(images, MAX_IMAGES_PER_BATCH)
@@ -436,13 +517,13 @@ def summarize_with_gemini(
             return call_gemini(
                 api_key,
                 model,
-                [{"text": build_initial_prompt(title, description)}],
+                [{"text": build_initial_prompt(title, description, related_context_markdown)}],
             ).strip()
 
         for index, batch_images in enumerate(image_batches):
             uploaded_files: list[dict[str, str]] = []
             if index == 0:
-                parts = [{"text": build_initial_prompt(title, description)}]
+                parts = [{"text": build_initial_prompt(title, description, related_context_markdown)}]
             else:
                 existing_markdown = markdown_path.read_text(encoding="utf-8")
                 parts = [
@@ -483,6 +564,7 @@ def process_url(
     jira_token: str,
     gemini_api_key: str,
     gemini_model: str,
+    related_context_markdown: str = "",
     temp_dir: str | None = None,
 ) -> dict[str, str]:
     key = extract_issue_key_hint(url)
@@ -505,6 +587,7 @@ def process_url(
             images=images,
             api_key=gemini_api_key,
             model=gemini_model,
+            related_context_markdown=related_context_markdown,
             temp_dir=temp_dir,
         )
         return {"key": key, "title": title, "summary": summary}
@@ -542,37 +625,40 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    results: list[dict[str, str] | None] = [None] * len(args.url)
-    max_workers = max(1, min(5, len(args.url)))
+    date_label = get_result_date_label()
+    get_results_directory(current_date=date_label)
+    batch_context_path: Path | None = None
+    if len(args.url) > 1:
+        batch_context_path = get_batch_context_path(current_date=date_label)
+        batch_context_path.write_text("", encoding="utf-8")
+
+    results: list[dict[str, str]] = []
     persist_errors: list[str] = []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(
-                process_url,
-                url,
-                jira_email,
-                jira_token,
-                gemini_api_key,
-                gemini_model,
-            ): index
-            for index, url in enumerate(args.url)
-        }
-        for future in concurrent.futures.as_completed(futures):
-            index = futures[future]
-            result = future.result()
-            results[index] = result
-            try:
-                persist_issue_result(result)
-            except OSError as error:
-                persist_errors.append(str(error))
-                issue_key = result.get("key") or args.url[index]
-                print(
-                    f"ERROR: Failed to write result file for {issue_key}: {error}",
-                    file=sys.stderr,
-                )
+    for index, url in enumerate(args.url):
+        related_context_markdown = read_batch_context(batch_context_path)
+        result = process_url(
+            url,
+            jira_email,
+            jira_token,
+            gemini_api_key,
+            gemini_model,
+            related_context_markdown=related_context_markdown,
+        )
+        results.append(result)
+        try:
+            persist_issue_result(result, current_date=date_label)
+            if batch_context_path is not None and not result["summary"].startswith(ERROR_PREFIX):
+                append_to_batch_context(batch_context_path, result)
+        except OSError as error:
+            persist_errors.append(str(error))
+            issue_key = result.get("key") or args.url[index]
+            print(
+                f"ERROR: Failed to write result file for {issue_key}: {error}",
+                file=sys.stderr,
+            )
 
-    final_results = [result for result in results if result is not None]
+    final_results = results
     print(json.dumps(final_results, indent=2, ensure_ascii=False))
 
     has_errors = any(
